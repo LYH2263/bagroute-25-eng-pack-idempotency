@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RouteOut(BaseModel):
@@ -49,6 +49,11 @@ class RejectOut(BaseModel):
 
 class PackRequest(BaseModel):
     route_id: int
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=100,
+        description="可选幂等令牌：同一路线携带相同令牌重复装袋时，直接返回首次成功结果，不重复写库",
+    )
 
 
 class WeightOut(BaseModel):

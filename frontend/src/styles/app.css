@@ -229,6 +229,7 @@ button {
 }
 .mono { font-family: "IBM Plex Mono", monospace; }
 .err { color: #ff9b7a; } .ok { color: #b6e356; }
+.hint { color: var(--muted, #9aa4b2); font-size: .85rem; margin: -.5rem 0 1rem; }
 
 /* page helpers — no card-grid dashboard */
 .route-strip {
