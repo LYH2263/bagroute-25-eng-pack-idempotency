@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -28,6 +28,8 @@ class SubscriberStop(Base):
 
 class PackBag(Base):
     __tablename__ = "pack_bags"
+    # sqlite_autoincrement 让 SQLite 与 Postgres 序列行为一致：id 单调递增不复用
+    __table_args__ = {"sqlite_autoincrement": True}
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     route_id: Mapped[int] = mapped_column(ForeignKey("delivery_routes.id"))
     bag_index: Mapped[int] = mapped_column(Integer)
@@ -55,4 +57,17 @@ class RejectRecord(Base):
     stop_id: Mapped[int] = mapped_column(Integer)
     stop_name: Mapped[str] = mapped_column(String(80))
     reason: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PackRequestRecord(Base):
+    """幂等装袋请求记录：同一路线同一幂等键只真正装袋一次，重复调用直接复用结果。"""
+
+    __tablename__ = "pack_request_records"
+    __table_args__ = (
+        UniqueConstraint("route_id", "idempotency_key", name="uq_pack_request_route_key"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    route_id: Mapped[int] = mapped_column(ForeignKey("delivery_routes.id"))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

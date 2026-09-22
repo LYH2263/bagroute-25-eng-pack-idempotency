@@ -1,9 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import BagItem, DeliveryRoute, PackBag, RejectRecord, SubscriberStop
+from app.models.models import (
+    BagItem,
+    DeliveryRoute,
+    PackBag,
+    PackRequestRecord,
+    RejectRecord,
+    SubscriberStop,
+)
 from app.schemas.schemas import (
     BagItemOut,
     BagOut,
@@ -36,21 +44,67 @@ def stops(route_id: int | None = None, db: Session = Depends(get_db)):
     return db.scalars(q).all()
 
 
+def _route_bags_out(db: Session, route_id: int) -> list[BagOut]:
+    rows = db.scalars(
+        select(PackBag).where(PackBag.route_id == route_id).order_by(PackBag.bag_index)
+    ).all()
+    return [
+        BagOut(
+            id=b.id,
+            route_id=b.route_id,
+            bag_index=b.bag_index,
+            weight_kg=b.weight_kg,
+            volume_l=b.volume_l,
+            items=[
+                BagItemOut(
+                    stop_id=i.stop_id,
+                    stop_name=i.stop_name,
+                    weight_kg=i.weight_kg,
+                    volume_l=i.volume_l,
+                )
+                for i in db.scalars(select(BagItem).where(BagItem.bag_id == b.id)).all()
+            ],
+        )
+        for b in rows
+    ]
+
+
+def _clear_route_pack(db: Session, route_id: int) -> None:
+    old_bags = db.scalars(select(PackBag).where(PackBag.route_id == route_id)).all()
+    for b in old_bags:
+        for it in list(b.items):
+            db.delete(it)
+        db.delete(b)
+    old_rej = db.scalars(select(RejectRecord).where(RejectRecord.route_id == route_id)).all()
+    for r in old_rej:
+        db.delete(r)
+    # 覆盖写入会让历史幂等键的缓存结果失效，一并清除，避免旧键回放到不一致的数据
+    old_keys = db.scalars(
+        select(PackRequestRecord).where(PackRequestRecord.route_id == route_id)
+    ).all()
+    for k in old_keys:
+        db.delete(k)
+    db.flush()
+
+
 @api_router.post("/pack", response_model=list[BagOut])
 def pack(body: PackRequest, db: Session = Depends(get_db)):
     route = db.get(DeliveryRoute, body.route_id)
     if not route:
         raise HTTPException(404, "路线不存在")
-    # clear previous pack for route
-    old_bags = db.scalars(select(PackBag).where(PackBag.route_id == route.id)).all()
-    for b in old_bags:
-        for it in list(b.items):
-            db.delete(it)
-        db.delete(b)
-    old_rej = db.scalars(select(RejectRecord).where(RejectRecord.route_id == route.id)).all()
-    for r in old_rej:
-        db.delete(r)
-    db.flush()
+    key = body.idempotency_key
+    if key:
+        existing = db.scalar(
+            select(PackRequestRecord).where(
+                PackRequestRecord.route_id == route.id,
+                PackRequestRecord.idempotency_key == key,
+            )
+        )
+        if existing:
+            # 幂等回放：直接返回该键首次成功写入的袋结果，不再改动袋行/拒收行
+            return _route_bags_out(db, route.id)
+
+    _clear_route_pack(db, route.id)
 
     stops = db.scalars(
         select(SubscriberStop).where(SubscriberStop.route_id == route.id).order_by(SubscriberStop.seq)
@@ -59,7 +113,6 @@ def pack(body: PackRequest, db: Session = Depends(get_db)):
         StopItem(s.id, s.seq, s.weight_kg, s.volume_l, s.name) for s in stops
     ]
     result = pack_route(items, route.max_weight_kg, route.max_volume_l)
-    out_bags: list[PackBag] = []
     for bag in result.bags:
         row = PackBag(
             route_id=route.id,
@@ -79,7 +132,6 @@ def pack(body: PackRequest, db: Session = Depends(get_db)):
                     volume_l=it.volume_l,
                 )
             )
-        out_bags.append(row)
     for stop, reason in result.rejects:
         db.add(
             RejectRecord(
@@ -89,26 +141,23 @@ def pack(body: PackRequest, db: Session = Depends(get_db)):
                 reason=reason,
             )
         )
-    db.commit()
-    return [
-        BagOut(
-            id=b.id,
-            route_id=b.route_id,
-            bag_index=b.bag_index,
-            weight_kg=b.weight_kg,
-            volume_l=b.volume_l,
-            items=[
-                BagItemOut(
-                    stop_id=i.stop_id,
-                    stop_name=i.stop_name,
-                    weight_kg=i.weight_kg,
-                    volume_l=i.volume_l,
-                )
-                for i in db.scalars(select(BagItem).where(BagItem.bag_id == b.id)).all()
-            ],
+    if key:
+        db.add(PackRequestRecord(route_id=route.id, idempotency_key=key))
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发下同键请求已抢先提交：回滚本次写入，回放其结果
+        db.rollback()
+        existing = db.scalar(
+            select(PackRequestRecord).where(
+                PackRequestRecord.route_id == route.id,
+                PackRequestRecord.idempotency_key == key,
+            )
         )
-        for b in out_bags
-    ]
+        if not existing:
+            raise
+        return _route_bags_out(db, route.id)
+    return _route_bags_out(db, route.id)
 
 
 @api_router.get("/bags", response_model=list[BagOut])
